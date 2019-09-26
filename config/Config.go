@@ -34,7 +34,7 @@ func init() {
 		conf.DBName = getDBName(conf.MongoDBUri)
 	} else {
 		conf.DBName = os.Getenv("MONGODB_DB_NAME")
-		log.Println("using database", conf.DBName)
+		log.Println("[CONFIG]", "Using database", conf.DBName)
 	}
 
 	conf.GinDebug = os.Getenv("GIN_DEBUG") == "true"
@@ -43,6 +43,8 @@ func init() {
 	if conf.MQTTBroker == "" {
 		conf.MQTTBroker = "tcp://35.197.155.112:4443"
 	}
+
+	log.Println("[CONFIG]", "Using MQTTBroker", conf.MQTTBroker)
 }
 
 func Get() *Config {
