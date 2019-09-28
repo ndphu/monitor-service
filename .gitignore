@@ -1,2 +1,4 @@
 .idea
 monitor-service.iml
+go.mod
+go.sum
