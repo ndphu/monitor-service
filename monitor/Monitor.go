@@ -2,8 +2,10 @@ package monitor
 
 import (
 	"encoding/json"
+	"errors"
 	"github.com/eclipse/paho.mqtt.golang"
 	"github.com/globalsign/mgo/bson"
+	"github.com/google/uuid"
 	"github.com/ndphu/swd-commons/model"
 	"github.com/ndphu/swd-commons/service"
 	"log"
@@ -14,118 +16,126 @@ import (
 )
 
 func Start() {
-	doMonitor()
+	doMonitorDevices()
 	ticker := time.NewTicker(30 * time.Second)
 	for {
 		log.Println("[MONITOR] Waiting for ticker...")
 		startAt := <-ticker.C
 		log.Println("[MONITOR] Job start at", startAt)
-		doMonitor()
+		doMonitorDevices()
 		log.Println("[MONITOR] Job done at", time.Now())
 	}
 }
 
-func doMonitor() {
-	rules := make([]model.Rule, 0)
-	if err := dao.Collection("rule").Find(nil).All(&rules); err != nil {
-		log.Println("[MONITOR] Fail to load rules by error:", err.Error())
+func doMonitorDevices() {
+	devices := make([]model.Device, 0)
+	if err := dao.Collection("device").Find(nil).All(&devices); err != nil {
+		log.Println("[MONITOR]", "Fail to load devices by error:", err.Error())
 		return
 	}
-	log.Println("[MONITOR] Working on", len(rules), "rules")
-
 	wg := sync.WaitGroup{}
 
-	for _, rule := range rules {
+	for _, device := range devices {
 		wg.Add(1)
-		go func(r model.Rule) {
+		go func(d model.Device) {
 			defer wg.Done()
-			processRule(r)
-		}(rule)
-
+			doMonitorDevice(d)
+		}(device)
 	}
 
 	wg.Wait()
+
 }
+func doMonitorDevice(device model.Device) {
+	log.Println("[MONITOR]", "Monitoring device", device.DeviceId, device.Name)
 
-func processRule(r model.Rule) {
-	log.Println("[MONITOR] Processing rule", r.Id.Hex())
+	frameDelay := 500 //ms
+	totalPics := 10
 
-	frameDelay := 1000 //ms
-	totalPics := 5
-
-	if frames, err := service.CaptureFrameContinuously(service.NewClientOpts(config.Get().MQTTBroker), r.DeviceId, frameDelay, totalPics); err != nil {
-		saveCaptureFailEvent(r)
+	if frames, err := service.CaptureFrameContinuously(service.NewClientOpts(config.Get().MQTTBroker), device.DeviceId, frameDelay, totalPics); err != nil {
+		saveCaptureFailEvent(device)
 		return
 	} else {
-		if response, err := service.CallBulkRecognize(service.NewClientOpts(config.Get().MQTTBroker), r.ProjectId, frames); err != nil {
-			saveRecognizeFailEvent(r, err)
+		var faces []model.Face
+		if err := dao.Collection("face").Find(bson.M{
+			"deskId": device.DeskId,
+			"owner":  device.Owner,
+		}).All(&faces); err != nil {
+			saveRecognizeFailEvent(device, err)
+			return
+		}
+		if len(faces) == 0 {
+			saveRecognizeFailEvent(device, errors.New("NO_FACE_DATA_TO_RECOGNIZE"))
+			return
+		}
+		if response, err := service.CallBulkRecognizeWithProvidedFacesData(service.NewClientOpts(config.Get().MQTTBroker), device.DeskId, frames, faces); err != nil {
+			saveRecognizeFailEvent(device, err)
 			return
 		} else {
-			log.Println("[MONITOR] Device:", r.DeviceId, "Found labels:", response.Labels)
+			log.Println("[MONITOR] Device:", device.DeviceId, "Found labels:", response.Labels)
 
-			if err := saveRecognizeSuccessEvent(r, response.Labels); err != nil {
-				log.Println("[MONITOR] Device:", r.DeviceId, "Fail to save event by error:", err.Error())
+			evt, err := saveRecognizeSuccessEvent(device, response.Labels)
+			if err != nil {
+				log.Println("[MONITOR] Device:", device.DeviceId, "Fail to save event by error:", err.Error())
+				return
 			}
 
-			matchPeople := false
-			for _, label := range response.Labels {
-				if label == r.ProjectId {
-					matchPeople = true
-					break
-				}
-			}
+			isUserPresent := evt.Result == model.ResultPresent
+			log.Println("[MONITOR]", "Is user present:", isUserPresent)
 
-			log.Println("[MONITOR]", "Match People:", matchPeople)
-
-			if matchPeople {
-				if events, err := getRecentRecognizeResult(r); err != nil {
-					log.Println("[MONITOR]", "Fail to get recent events by error", err.Error())
-				} else {
-					log.Println("[MONITOR]", "Found", len(events), "events")
-					shouldSendNotification := true
-
-					consecutiveMissing := 0
-
-					for _, event := range events {
-						hasLabel := false
-						for _, l := range event.Labels {
-							if l == r.ProjectId {
-								hasLabel = true
-								break
-							}
-						}
-						if hasLabel {
-							log.Println("reset consecutive count")
-							consecutiveMissing = 0
-						} else {
-							consecutiveMissing ++
-							log.Println("current consecutive", consecutiveMissing)
-							if consecutiveMissing == 3 {
-								shouldSendNotification = false
-								break
-							}
-						}
-					}
-					// TODO: should check last present after consecutive too
-
-					log.Println("[MONITOR]", "Rule:", r.Id.Hex(), "Should send notification:", shouldSendNotification)
-					if shouldSendNotification {
-						sendNotification(r)
-					}
-				}
+			if isUserPresent && shouldSendNotification(device) {
+				sendNotification(device)
 			}
 		}
 
 	}
-	log.Println("[MONITOR] Processing done for rule", r.Id.Hex())
+	log.Println("[MONITOR] Processing done for device", device.DeviceId, device.Name)
+}
+func shouldSendNotification(device model.Device) bool {
+	if events, err := getRecentRecognizeResult(device); err != nil {
+		log.Println("[MONITOR]", "Fail to get recent events by error", err.Error())
+		return false
+	} else {
+		log.Println("[MONITOR]", "Found", len(events), "events")
+		shouldSendNotification := true
+
+		consecutiveMissing := 0
+
+		for _, event := range events {
+			if event.Result == model.ResultPresent {
+				log.Println("[MONITOR]", "Reset consecutive count")
+				consecutiveMissing = 0
+			} else {
+				consecutiveMissing ++
+				log.Println("[MONITOR]", "Current consecutive", consecutiveMissing)
+				if consecutiveMissing == 3 {
+					shouldSendNotification = false
+					break
+				}
+			}
+		}
+		// TODO: should check last present after consecutive too
+
+		log.Println("[MONITOR]", "Should send notification:", shouldSendNotification)
+		return shouldSendNotification
+	}
 }
 
-func sendNotification(rule model.Rule) {
+func sendNotification(device model.Device) {
+	sc := model.SlackConfig{}
+	err := dao.Collection("slack_config").Find(bson.M{"userId": device.Owner}).One(&sc)
+	if err != nil {
+		log.Println("[MONITOR]", "Fail to send notification by error", err.Error())
+		return
+	}
+
 	nf := model.Notification{
-		ProjectId: rule.ProjectId,
-		DeviceId:  rule.DeviceId,
-		Timestamp: time.Now(),
-		RuleId:    rule.Id,
+		DeskId:      device.DeskId,
+		DeviceId:    device.DeviceId,
+		UserId:      device.Owner,
+		Timestamp:   time.Now(),
+		Type:        "SLACK",
+		SlackUserId: sc.SlackUserId,
 	}
 
 	if payload, err := json.Marshal(nf); err != nil {
@@ -147,29 +157,75 @@ func sendNotification(rule model.Rule) {
 	}
 }
 
-func saveCaptureFailEvent(rule model.Rule) error {
-	event := newEvent(rule)
-	event.Type = model.EventCaptureFail
-	return dao.Collection("event").Insert(event)
+func saveCaptureFailEvent(d model.Device) error {
+	//event := newEvent(rule)
+	event := model.Event{
+		Id:        bson.NewObjectId(),
+		DeviceId:  d.DeviceId,
+		Timestamp: time.Now(),
+		Type:      model.EventCaptureFail,
+		UserId:    d.Owner,
+	}
+	return dao.Collection("event").Insert(&event)
 }
 
-func saveRecognizeSuccessEvent(rule model.Rule, labels []string) error {
-	event := newEvent(rule)
-	event.Labels = labels
-	event.Type = model.EventRecognizeSuccess
-	event.Result = model.ResultMissing
+func saveRecognizeSuccessEvent(device model.Device, labels []string) (*model.Event, error) {
+	event := model.Event{
+		Id:        bson.NewObjectId(),
+		DeviceId:  device.DeviceId,
+		Timestamp: time.Now(),
+		Type:      model.EventRecognizeSuccess,
+		UserId:    device.Owner,
+		Labels:    labels,
+		Result:    model.ResultMissing,
+	}
 	for _, l := range labels {
-		if l == rule.ProjectId {
+		if l == device.Owner.Hex() {
 			event.Result = model.ResultPresent
 		}
 	}
-	return dao.Collection("event").Insert(event)
+	err := dao.Collection("event").Insert(event)
+	if err == nil {
+		go broadcastEvent(&event)
+	}
+	return &event, err
 }
 
-func saveRecognizeFailEvent(rule model.Rule, err error) error {
-	event := newEvent(rule)
-	event.Error = err.Error()
-	event.Type = model.EventRecognizeFail
+func broadcastEvent(evt *model.Event) {
+	log.Println("[EVENT]", "Broadcasting event...")
+	ops := service.NewClientOpts(config.Get().MQTTBroker)
+	ops.ClientID = uuid.New().String()
+
+	ops.OnConnect = func(client mqtt.Client) {
+		log.Println("[EVENT]", "MQTT connected successfully")
+
+	}
+	client := mqtt.NewClient(ops)
+	if c := client.Connect(); c.Wait() && c.Error() != nil {
+		log.Println("[EVENT]", "Fail to connect to MQTT by error")
+	}
+	defer client.Disconnect(100)
+
+	if payload, err := json.Marshal(evt); err != nil {
+		log.Println("[EVENT]", "Fail to marshal event")
+	} else {
+		if p := client.Publish("/3ml/event/broadcast", 0, false, payload); p.Wait() && p.Error() != nil {
+			log.Println("[EVENT]", "Fail to publish event to MQTT", err.Error())
+		} else {
+			log.Println("[EVENT]", "Event broadcast successfully")
+		}
+	}
+}
+
+func saveRecognizeFailEvent(device model.Device, err error) error {
+	event := model.Event{
+		Id:        bson.NewObjectId(),
+		DeviceId:  device.DeviceId,
+		Timestamp: time.Now(),
+		Type:      model.EventRecognizeFail,
+		UserId:    device.Owner,
+		Error:     err.Error(),
+	}
 	return dao.Collection("event").Insert(event)
 }
 
@@ -181,9 +237,9 @@ func newEvent(rule model.Rule) *model.Event {
 	}
 }
 
-func getRecentRecognizeResult(rule model.Rule) ([]model.Event, error) {
+func getRecentRecognizeResult(device model.Device) ([]model.Event, error) {
 	events := make([]model.Event, 0)
-	if err := dao.Collection("event").Find(bson.M{"type": "RECOGNIZE_SUCCESS"}).Sort("-timestamp").Limit(rule.Interval * 2).All(&events);
+	if err := dao.Collection("event").Find(bson.M{"type": "RECOGNIZE_SUCCESS", "deviceId": device.DeviceId}).Sort("-timestamp").Limit(10).All(&events);
 		err != nil {
 		return nil, err
 	} else {
