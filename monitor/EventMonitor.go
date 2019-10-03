@@ -2,8 +2,11 @@ package monitor
 
 import (
 	"encoding/json"
+	"fmt"
 	"github.com/eclipse/paho.mqtt.golang"
+	"github.com/globalsign/mgo"
 	"github.com/globalsign/mgo/bson"
+	"github.com/hako/durafmt"
 	"github.com/ndphu/swd-commons/model"
 	"github.com/ndphu/swd-commons/service"
 	"log"
@@ -12,7 +15,9 @@ import (
 	"time"
 )
 
-func monitorEvents()  {
+var missingThresholdMinutes = 2
+
+func monitorEvents() {
 	opts := service.NewClientOpts(config.Get().MQTTBroker)
 	opts.OnConnect = func(client mqtt.Client) {
 		log.Println("[MQTT]", "Connected to broker")
@@ -33,63 +38,98 @@ func monitorEvents()  {
 		log.Fatalln("[MQTT]", "Fail to connect to message broker", tok.Error())
 	}
 
-	<- shutdownChan
+	<-shutdownChan
 	log.Println("[EVENT_MONITOR]", "Exiting event monitoring...")
 	defer c.Disconnect(100)
 }
 
-func handleEvent(evt *model.Event)  {
+func handleEvent(evt *model.Event) {
 	log.Println("[EVENT_MONITOR]", "Handling event", evt.Type, evt.Result, "of device", evt.DeviceId)
 
 	isUserPresent := evt.Result == model.ResultPresent
 	log.Println("[MONITOR]", "Is user present:", isUserPresent)
 
-	if isUserPresent && shouldSendNotification(evt.DeviceId) {
-		//sendNotification(evt)
-		var d model.Device
-		if err := dao.Collection("device").Find(bson.M{"deviceId": evt.DeviceId}).One(&d); err == nil {
-			sendNotification(d)
+	sit := model.SitTracking{}
+	err := dao.Collection("sit_tracking").Find(bson.M{"deviceId": evt.DeviceId, "userId": evt.UserId}).One(&sit)
+	if err == mgo.ErrNotFound {
+		sit.UserId = evt.UserId
+		sit.DeviceId = evt.DeviceId
+		sit.Id = bson.NewObjectId()
+		if isUserPresent {
+			sit.Status = model.SitStatusPresent
+		} else {
+			sit.Status = model.SitStatusMissing
 		}
+		sit.TrackingTime = time.Now()
+		if err := dao.Collection("sit_tracking").Insert(sit); err != nil {
+			log.Println("[EVENT_MONITOR]", "Fail to save sit tracking status", err.Error())
+		}
+		return
 	}
-}
 
-func shouldSendNotification(deviceId string) bool {
-	if events, err := getRecentRecognizeResult(deviceId); err != nil {
-		log.Println("[MONITOR]", "Fail to get recent events by error", err.Error())
-		return false
-	} else {
-		log.Println("[MONITOR]", "Found", len(events), "events")
-		shouldSendNotification := true
-
-		consecutiveMissing := 0
-
-		for _, event := range events {
-			if event.Result == model.ResultPresent {
-				log.Println("[MONITOR]", "Reset consecutive count")
-				consecutiveMissing = 0
-			} else {
-				consecutiveMissing ++
-				log.Println("[MONITOR]", "Current consecutive", consecutiveMissing)
-				if consecutiveMissing == 3 {
-					shouldSendNotification = false
-					break
+	if isUserPresent {
+		if sit.Status == model.SitStatusPresent {
+			sittingDuration := time.Since(sit.TrackingTime)
+			sittingMinute := sittingDuration.Minutes()
+			log.Println("[EVENT_MONITOR]", "User may sitting for", durafmt.Parse(sittingDuration))
+			if sittingMinute >= 3 {
+				log.Println("[EVENT_MONITOR]", "Sending notification to user", evt.UserId.Hex())
+				var d model.Device
+				if err := dao.Collection("device").Find(bson.M{"deviceId": evt.DeviceId}).One(&d); err == nil {
+					sendNotification(d, sittingDuration)
 				}
+			} else {
+				log.Println("[EVENT_MONITOR]", "User sitting duration is below threshold. Do nothing.")
+			}
+		} else {
+			log.Println("[EVENT_MONITOR]", "Update sit tracking to PRESENT")
+			sit.Status = model.SitStatusPresent
+			sit.TrackingTime = time.Now()
+			if err := dao.Collection("sit_tracking").UpdateId(sit.Id, &sit); err != nil {
+				log.Println("[EVENT_MONITOR]", "Fail to update sit tracking status to PRESENT", err.Error())
 			}
 		}
-		// TODO: should check last present after consecutive too
-
-		log.Println("[MONITOR]", "Should send notification:", shouldSendNotification)
-		return shouldSendNotification
+	} else {
+		if sit.Status == model.SitStatusPresent {
+			since := time.Now().Add(-time.Duration(missingThresholdMinutes) * time.Minute)
+			if c, err := dao.Collection("event").Find(bson.M{
+				"deviceId": evt.DeviceId,
+				"owner":    evt.UserId,
+				"timestamp": bson.M{
+					"$gt": since,
+				},
+				"result": model.ResultPresent,
+			}).Count(); err != nil {
+				log.Println("[EVENT_MONITOR]", "Fail to query PRESENT event status", err.Error())
+			} else {
+				log.Println("[EVENT_MONITOR]", "Found", c, "PRESENT events since", since)
+				if c == 0 {
+					// no present event found in last threshold minute. Update status to missing
+					log.Println("[EVENT_MONITOR", "User is missing for a while. Update sit tracking to MISSING")
+					sit.Status = model.SitStatusMissing
+					sit.TrackingTime = time.Now()
+					if err := dao.Collection("sit_tracking").UpdateId(sit.Id, &sit); err != nil {
+						log.Println("[EVENT_MONITOR]", "Fail to update sit tracking status to MISSING", err.Error())
+					}
+				} else {
+					log.Println("[EVENT_MONITOR]", "User may still around. Do nothing for now.")
+				}
+			}
+		} else {
+			log.Println("[EVENT_MONITOR]", "User still missing. Do nothing.")
+		}
 	}
 }
 
-func sendNotification(device model.Device) {
+func sendNotification(device model.Device, sitDuration time.Duration) {
 	sc := model.SlackConfig{}
 	err := dao.Collection("slack_config").Find(bson.M{"userId": device.Owner}).One(&sc)
 	if err != nil {
 		log.Println("[MONITOR]", "Fail to send notification by error", err.Error())
 		return
 	}
+	userMsg := fmt.Sprintf("You are sitting for too long time: *%s*.\n" +
+		"To protect your health, please consider to standup and some exercises.", durafmt.Parse(sitDuration.Round(time.Second)).String())
 
 	nf := model.Notification{
 		DeskId:      device.DeskId,
@@ -98,6 +138,7 @@ func sendNotification(device model.Device) {
 		Timestamp:   time.Now(),
 		Type:        "SLACK",
 		SlackUserId: sc.SlackUserId,
+		Message:     userMsg,
 	}
 
 	if payload, err := json.Marshal(nf); err != nil {
