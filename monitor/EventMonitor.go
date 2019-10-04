@@ -2,7 +2,6 @@ package monitor
 
 import (
 	"encoding/json"
-	"fmt"
 	"github.com/eclipse/paho.mqtt.golang"
 	"github.com/globalsign/mgo"
 	"github.com/globalsign/mgo/bson"
@@ -21,7 +20,7 @@ func monitorEvents() {
 	opts := service.NewClientOpts(config.Get().MQTTBroker)
 	opts.OnConnect = func(client mqtt.Client) {
 		log.Println("[MQTT]", "Connected to broker")
-		client.Subscribe("/3ml/event/broadcast", 0, func(client mqtt.Client, message mqtt.Message) {
+		client.Subscribe(model.TopicEventBroadcast, 0, func(client mqtt.Client, message mqtt.Message) {
 			e := model.Event{}
 			if err := json.Unmarshal(message.Payload(), &e); err != nil {
 				log.Println("[MQTT]", "Fail to unmarshal message", string(message.Payload()))
@@ -49,6 +48,23 @@ func handleEvent(evt *model.Event) {
 	isUserPresent := evt.Result == model.ResultPresent
 	log.Println("[MONITOR]", "Is user present:", isUserPresent)
 
+	var rule model.Rule
+	var ruleType string
+	if evt.Type == model.EventRecognizeSuccess {
+		ruleType = model.RuleTypeSittingMonitoring
+	}
+
+	if err := dao.Collection("rule").Find(bson.M{
+		"deskId": evt.DeskId,
+		"userId": evt.UserId,
+		"type":   ruleType,
+	}).One(&rule); err != nil {
+		log.Println("[EVENT_MONITOR]", "No RULE found for sitting monitoring.")
+		return
+	}
+
+	log.Println("[EVENT_MONITOR]", "Found rule", rule.Type, "with interval minutes", rule.IntervalMinutes)
+
 	sit := model.SitTracking{}
 	err := dao.Collection("sit_tracking").Find(bson.M{"deviceId": evt.DeviceId, "userId": evt.UserId}).One(&sit)
 	if err == mgo.ErrNotFound {
@@ -70,13 +86,12 @@ func handleEvent(evt *model.Event) {
 	if isUserPresent {
 		if sit.Status == model.SitStatusPresent {
 			sittingDuration := time.Since(sit.TrackingTime)
-			sittingMinute := sittingDuration.Minutes()
-			log.Println("[EVENT_MONITOR]", "User may sitting for", durafmt.Parse(sittingDuration))
-			if sittingMinute >= 3 {
+			log.Println("[EVENT_MONITOR]", "User may sitting contiguously for", durafmt.Parse(sittingDuration))
+			if sittingDuration.Minutes() >= float64(rule.IntervalMinutes) {
 				log.Println("[EVENT_MONITOR]", "Sending notification to user", evt.UserId.Hex())
 				var d model.Device
 				if err := dao.Collection("device").Find(bson.M{"deviceId": evt.DeviceId}).One(&d); err == nil {
-					sendNotification(d, sittingDuration)
+					sendNotification(d, sittingDuration, rule)
 				}
 			} else {
 				log.Println("[EVENT_MONITOR]", "User sitting duration is below threshold. Do nothing.")
@@ -121,24 +136,15 @@ func handleEvent(evt *model.Event) {
 	}
 }
 
-func sendNotification(device model.Device, sitDuration time.Duration) {
-	sc := model.SlackConfig{}
-	err := dao.Collection("slack_config").Find(bson.M{"userId": device.Owner}).One(&sc)
-	if err != nil {
-		log.Println("[MONITOR]", "Fail to send notification by error", err.Error())
-		return
-	}
-	userMsg := fmt.Sprintf("You are sitting for too long time: *%s*.\n" +
-		"To protect your health, please consider to standup and some exercises.", durafmt.Parse(sitDuration.Round(time.Second)).String())
-
+func sendNotification(device model.Device, sitDuration time.Duration, rule model.Rule) {
 	nf := model.Notification{
 		DeskId:      device.DeskId,
 		DeviceId:    device.DeviceId,
 		UserId:      device.Owner,
 		Timestamp:   time.Now(),
-		Type:        "SLACK",
-		SlackUserId: sc.SlackUserId,
-		Message:     userMsg,
+		Type:        model.NotificationTypeSlack,
+		SitDuration: sitDuration,
+		Rule:        rule,
 	}
 
 	if payload, err := json.Marshal(nf); err != nil {
@@ -150,22 +156,12 @@ func sendNotification(device model.Device, sitDuration time.Duration) {
 			log.Println("[MONITOR]", "Fail to connect to MQTT", token.Error())
 			return
 		}
-		if token := client.Publish("/3ml/notifications/broadcast", 0, false, payload); token.Wait() && token.Error() != nil {
+		if token := client.Publish(model.TopicNotificationBroadcast, 0, false, payload); token.Wait() && token.Error() != nil {
 			log.Println("[MONITOR]", "Fail publish notification via MQTT", token.Error())
 		} else {
 			log.Println("[MONITOR]", "Notification published successfully")
 		}
 
 		defer client.Disconnect(200)
-	}
-}
-
-func getRecentRecognizeResult(deviceId string) ([]model.Event, error) {
-	events := make([]model.Event, 0)
-	if err := dao.Collection("event").Find(bson.M{"type": "RECOGNIZE_SUCCESS", "deviceId": deviceId}).Sort("-timestamp").Limit(10).All(&events);
-		err != nil {
-		return nil, err
-	} else {
-		return events, err
 	}
 }

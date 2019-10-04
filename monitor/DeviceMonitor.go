@@ -56,7 +56,14 @@ func doMonitorDevice(device model.Device) {
 			saveRecognizeFailEvent(device, errors.New("NO_FACE_DATA_TO_RECOGNIZE"))
 			return
 		}
-		if response, err := service.CallBulkRecognizeWithProvidedFacesData(service.NewClientOpts(config.Get().MQTTBroker), device.DeskId, frames, faces); err != nil {
+		if response, err := service.CallRecognizeWithRequest(service.NewClientOpts(config.Get().MQTTBroker), model.RecognizeRequest{
+			DeskId:              device.DeskId,
+			Images:              frames,
+			FacesData:           faces,
+			ClassifyFaces:       true,
+			IncludeFacesDetails: false,
+			TimeoutSeconds:      15,
+		}); err != nil {
 			saveRecognizeFailEvent(device, err)
 			return
 		} else {
@@ -89,6 +96,7 @@ func saveRecognizeSuccessEvent(device model.Device, labels []string) (*model.Eve
 	event := model.Event{
 		Id:        bson.NewObjectId(),
 		DeviceId:  device.DeviceId,
+		DeskId:    device.DeskId,
 		Timestamp: time.Now(),
 		Type:      model.EventRecognizeSuccess,
 		UserId:    device.Owner,
@@ -122,7 +130,7 @@ func broadcastEvent(evt *model.Event) {
 	if payload, err := json.Marshal(evt); err != nil {
 		log.Println("[EVENT]", "Fail to marshal event")
 	} else {
-		if p := client.Publish("/3ml/event/broadcast", 0, false, payload); p.Wait() && p.Error() != nil {
+		if p := client.Publish(model.TopicEventBroadcast, 0, false, payload); p.Wait() && p.Error() != nil {
 			log.Println("[EVENT]", "Fail to publish event to MQTT", err.Error())
 		} else {
 			log.Println("[EVENT]", "Event broadcast successfully")
@@ -140,12 +148,4 @@ func saveRecognizeFailEvent(device model.Device, err error) error {
 		Error:     err.Error(),
 	}
 	return dao.Collection("event").Insert(event)
-}
-
-func newEvent(rule model.Rule) *model.Event {
-	return &model.Event{
-		Id:        bson.NewObjectId(),
-		DeviceId:  rule.DeviceId,
-		Timestamp: time.Now(),
-	}
 }
