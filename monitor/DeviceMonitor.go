@@ -15,26 +15,41 @@ import (
 	"time"
 )
 
+func monitorCameraDevices() {
+	ticker := time.NewTicker(30 * time.Second)
+	for {
+		log.Println("[MONITOR] Waiting for ticker...")
+		startAt := <-ticker.C
+		log.Println("[MONITOR] Job start at", startAt)
+		doMonitorDevices()
+		log.Println("[MONITOR] Job done at", time.Now())
+	}
+}
+
 func doMonitorDevices() {
-	devices := make([]model.Device, 0)
-	if err := dao.Collection("device").Find(nil).All(&devices); err != nil {
-		log.Println("[MONITOR]", "Fail to load devices by error:", err.Error())
+	cameraDevices := make([]model.Device, 0)
+	if err := dao.Collection("device").Find(bson.M{"type": model.DeviceTypeCamera}).All(&cameraDevices); err != nil {
+		log.Println("[MONITOR]", "Fail to load cameraDevices by error:", err.Error())
 		return
 	}
 	wg := sync.WaitGroup{}
 
-	for _, device := range devices {
+	for _, camera := range cameraDevices {
 		wg.Add(1)
 		go func(d model.Device) {
 			defer wg.Done()
-			doMonitorDevice(d)
-		}(device)
+			switch d.Type {
+			case model.DeviceTypeCamera:
+				monitorCameraDevice(d)
+				break
+			}
+		}(camera)
 	}
 
 	wg.Wait()
 
 }
-func doMonitorDevice(device model.Device) {
+func monitorCameraDevice(device model.Device) {
 	log.Println("[MONITOR]", "Monitoring device", device.DeviceId, device.Name)
 
 	frameDelay := 500 //ms
