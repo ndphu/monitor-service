@@ -44,7 +44,45 @@ func monitorEvents() {
 
 func handleEvent(evt *model.Event) {
 	log.Println("[EVENT_MONITOR]", "Handling event", evt.Type, evt.Result, "of device", evt.DeviceId)
+	switch evt.Type {
+	case model.EventRecognizeSuccess:
+		handleRecognizeEvent(evt)
+		break
+	case model.EventCaptureFail:
+		handleCaptureFailEvent(evt)
+		break
+	}
+}
 
+func handleCaptureFailEvent(evt *model.Event) {
+	nf := model.Notification{
+		DeskId:      evt.DeskId,
+		DeviceId:    evt.DeviceId,
+		UserId:      evt.UserId,
+		Timestamp:   time.Now(),
+		Type:        model.NotificationTypeDeviceStatusAlert,
+	}
+
+	if payload, err := json.Marshal(nf); err != nil {
+		log.Println("[MONITOR]", "Fail to marshal notification")
+	} else {
+		opts := service.NewClientOpts(config.Get().MQTTBroker)
+		client := mqtt.NewClient(opts)
+		if token := client.Connect(); token.Wait() && token.Error() != nil {
+			log.Println("[MONITOR]", "Fail to connect to MQTT", token.Error())
+			return
+		}
+		if token := client.Publish(model.TopicNotificationBroadcast, 0, false, payload); token.Wait() && token.Error() != nil {
+			log.Println("[MONITOR]", "Fail publish notification via MQTT", token.Error())
+		} else {
+			log.Println("[MONITOR]", "Notification published successfully")
+		}
+
+		defer client.Disconnect(200)
+	}
+}
+
+func handleRecognizeEvent(evt *model.Event) {
 	isUserPresent := evt.Result == model.ResultPresent
 	log.Println("[MONITOR]", "Is user present:", isUserPresent)
 
@@ -91,7 +129,7 @@ func handleEvent(evt *model.Event) {
 				log.Println("[EVENT_MONITOR]", "Sending notification to user", evt.UserId.Hex())
 				var d model.Device
 				if err := dao.Collection("device").Find(bson.M{"deviceId": evt.DeviceId}).One(&d); err == nil {
-					sendNotification(d, sittingDuration, rule)
+					sendSittingNotification(d, sittingDuration, rule)
 				}
 			} else {
 				log.Println("[EVENT_MONITOR]", "User sitting duration is below threshold. Do nothing.")
@@ -136,13 +174,13 @@ func handleEvent(evt *model.Event) {
 	}
 }
 
-func sendNotification(device model.Device, sitDuration time.Duration, rule model.Rule) {
+func sendSittingNotification(device model.Device, sitDuration time.Duration, rule model.Rule) {
 	nf := model.Notification{
 		DeskId:      device.DeskId,
 		DeviceId:    device.DeviceId,
 		UserId:      device.Owner,
 		Timestamp:   time.Now(),
-		Type:        model.NotificationTypeSlack,
+		Type:        model.NotificationTypeSittingRemind,
 		SitDuration: sitDuration,
 		Rule:        rule,
 	}

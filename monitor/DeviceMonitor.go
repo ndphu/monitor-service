@@ -88,8 +88,13 @@ func saveCaptureFailEvent(d model.Device) error {
 		Timestamp: time.Now(),
 		Type:      model.EventCaptureFail,
 		UserId:    d.Owner,
+		DeskId:    d.DeskId,
 	}
-	return dao.Collection("event").Insert(&event)
+	if err := dao.Collection("event").Insert(event); err != nil {
+		return err
+	}
+	go broadcastEvent(&event)
+	return nil
 }
 
 func saveRecognizeSuccessEvent(device model.Device, labels []string) (*model.Event, error) {
